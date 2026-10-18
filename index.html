@@ -168,6 +168,12 @@ footer a{color:var(--ink)}
       <button class="btn accent" id="dl">Download forecast for offline</button>
     </div>
     <div class="msg" id="dlMsg" role="status"></div>
+    <div class="row" style="align-items:end;margin-top:12px">
+      <label class="field" style="max-width:130px">Airport code (optional)<input id="apt" type="text" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="Auto"></label>
+      <button class="btn" id="aptBtn" type="button">Get airport readings</button>
+    </div>
+    <div class="msg" id="aptMsg" role="status"></div>
+    <div class="note">Actual readings from the airport replace the forecast for the hours they cover. It finds the closest airport to your spot on its own, up to 40 miles away. Type a code like KFZG only to pick a different one. If no airport is close enough or it cannot be reached, the forecast is used.</div>
     <details id="manualBox">
       <summary>Enter conditions by hand</summary>
       <form id="manualForm">
@@ -376,6 +382,40 @@ function reasons(sp,b){
   pos.sort((a,b2)=>b2[0]-a[0]);
   return{pos:pos.slice(0,3).map(x=>x[1]),neg:neg.map(x=>x[1])};
 }
+const distMi=(a,b,c,d)=>{const R=3958.8,r=Math.PI/180,x=(c-a)*r,y=(d-b)*r,h=Math.sin(x/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin(y/2)**2;return 2*R*Math.asin(Math.min(1,Math.sqrt(h)));};
+function nearestStation(rows,lat,lon,maxMi){
+  let best=null;
+  (rows||[]).forEach(r=>{
+    if(!r||!r.icaoId||typeof r.lat!=='number'||typeof r.lon!=='number')return;
+    const d=distMi(lat,lon,r.lat,r.lon);
+    if(d<=maxMi&&(!best||d<best.mi))best={id:r.icaoId,name:String(r.name||r.icaoId),mi:d};
+  });
+  return best;
+}
+/* Airport (METAR) readings -> hourly records in the same shape as the forecast hours. */
+function obsToHours(rows){
+  const by=new Map();
+  (rows||[]).forEach(r=>{
+    if(!r)return;
+    const ts=typeof r.obsTime==='number'?r.obsTime*1000:Date.parse(String(r.reportTime||'').replace(' ','T')+'Z');
+    const alt=typeof r.altim==='number'?r.altim:typeof r.slp==='number'?r.slp:null;
+    if(!isFinite(ts)||typeof r.temp!=='number'||alt==null||alt<850||alt>1090)return;
+    const k=Math.floor(ts/HR);
+    let a=by.get(k);if(!a){a={t:k*HR,temps:[],ps:[],ws:[],vx:0,vy:0,nd:0,rain:0,last:0};by.set(k,a);}
+    a.temps.push(r.temp*9/5+32);a.ps.push(alt*0.02953);
+    const wxs=String(r.wxString||'')||String(r.rawOb||'').split(' RMK')[0].split(/\s+/).filter(t=>/^[-+]?(VC)?(RA|DZ|SH|TS)/.test(t)).join(' ');
+    const kt=typeof r.wspd==='number'?r.wspd:0;a.ws.push(kt*1.15078);
+    if(typeof r.wdir==='number'&&kt>=3){const rad=r.wdir*Math.PI/180;a.vx+=Math.sin(rad)*kt;a.vy+=Math.cos(rad)*kt;a.nd++;}
+    if(/(RA|DZ|SH|TS)/.test(wxs))a.rain=Math.max(a.rain,/\+(RA|SH|TS)/.test(wxs)?3:0.3);
+    a.last=Math.max(a.last,ts);
+  });
+  const avg=a=>a.reduce((s,x)=>s+x,0)/a.length;
+  const hours=[...by.values()].sort((x,y)=>x.t-y.t).map(a=>({t:a.t,temp:avg(a.temps),p:avg(a.ps),wind:avg(a.ws),
+    dir:a.nd?((Math.atan2(a.vx,a.vy)*180/Math.PI)+360)%360:null,rain:a.rain,obs:true,last:a.last}));
+  const idx=new Map(hours.map(h=>[Math.floor(h.t/HR),h]));
+  hours.forEach(h=>{const k=Math.floor(h.t/HR),b=idx.get(k-6),c=idx.get(k-3);h.d6=b?h.p-b.p:c?(h.p-c.p)*2:null;});
+  return hours;
+}
 /*CORE_END*/
 
 /* ---------- app ---------- */
@@ -390,7 +430,7 @@ const state={
   spot:Object.assign({stand:[]},store.get('spot',DEF_SPOT)),spots:store.get('spots',[]),sp:store.get('sp','deer'),
   day:startOfDay(Date.now()),wx:store.get('wx',{}),
   manual:store.get('manual',{on:true,example:true,p:30.02,trend:'f',temp:58,wind:5,rain:'none'}),
-  log:store.get('log',[])
+  log:store.get('log',[]),obs:store.get('obs',{})
 };
 if(!SPECIES[state.sp])state.sp='deer';
 const MAN_D6={ff:-0.12,f:-0.06,s:0,r:0.06,rf:0.12},MAN_RAIN={none:0,light:0.3,heavy:3};
@@ -399,13 +439,18 @@ let wxMap=new Map();
 function rebuildWx(){
   wxMap=new Map();const e=state.wx[wxKey()];
   if(e)e.hours.forEach(h=>wxMap.set(Math.floor(h.t/HR),h));
+  const o=state.obs[wxKey()];
+  if(o)o.hours.forEach(h=>{
+    const k=Math.floor(h.t/HR),f=wxMap.get(k);
+    wxMap.set(k,Object.assign({},h,{rain:Math.max(h.rain||0,f&&f.rain||0)}));
+  });
 }
 function wxAt(t){
   const k=Math.floor(t/HR),h=wxMap.get(k);
   if(h){
     const b=wxMap.get(k-6),a=wxMap.get(k-3);
-    const d6=b?h.p-b.p:a?(h.p-a.p)*2:0;
-    return{temp:h.temp,press:h.p,d6,wind:h.wind,dir:h.dir==null?null:h.dir,rain:h.rain,src:'forecast'};
+    const d6=h.obs&&h.d6!=null?h.d6:b?h.p-b.p:a?(h.p-a.p)*2:0;
+    return{temp:h.temp,press:h.p,d6,wind:h.wind,dir:h.dir==null?null:h.dir,rain:h.rain,src:h.obs?'airport':'forecast'};
   }
   const m=state.manual;
   if(m&&m.on)return{temp:m.temp,press:m.p,d6:MAN_D6[m.trend]||0,wind:m.wind,dir:m.dir==null?null:m.dir*45,rain:MAN_RAIN[m.rain]||0,src:m.example?'example':'manual'};
@@ -441,6 +486,7 @@ function renderWeek(){
 function srcNote(src,ds){
   const e=state.wx[wxKey()];
   if(src==='forecast')return'<div class="note">Weather from the forecast saved '+new Date(e.fetchedAt).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'})+'.</div>';
+  if(src==='airport'){const o=state.obs[wxKey()];return'<div class="note">Weather from the '+(o?esc(o.name)+' airport ('+esc(o.id)+', '+Math.round(o.mi)+' mi away)':'airport')+' readings'+(o?' (latest '+new Date(o.hours[o.hours.length-1].last).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'})+')':'')+(state.wx[wxKey()]?', forecast for later hours.':'. Hours after the latest reading use the conditions you entered or the example.')+'</div>';}
   if(src==='example')return'<div class="note warn">Using example weather. Download a forecast or enter today\'s conditions below.</div>';
   if(src==='manual')return'<div class="note">Using the conditions you entered for the whole day.</div>';
   return'<div class="note warn">No weather loaded, so this score uses light and moon only.</div>';
@@ -507,6 +553,47 @@ async function fetchForecast(){
     return{t:new Date(y,mo-1,d,hh,mi).getTime(),temp:h.temperature_2m[i],p:h.pressure_msl[i]*0.02953,wind:h.wind_speed_10m[i],dir:h.wind_direction_10m?h.wind_direction_10m[i]:null,rain:h.precipitation[i]};
   }).filter(x=>x.temp!=null&&x.p!=null&&!isNaN(x.p));
 }
+const AWC='https://aviationweather.gov/api/data/metar?format=json&';
+async function awc(q){const r=await fetch(AWC+q);if(!r.ok)throw new Error('status '+r.status);const j=await r.json();return Array.isArray(j)?j:[];}
+const MAX_MI=40;
+async function findAirport(lat,lon,typed){
+  if(typed){
+    const rows=await awc('ids='+encodeURIComponent(typed)+'&hours=24');
+    const r=rows.find(x=>typeof x.lat==='number');if(!r)throw new Error('none');
+    const mi=distMi(lat,lon,r.lat,r.lon);
+    if(mi>MAX_MI){const e=new Error('far');e.far=Math.round(mi);throw e;}
+    return{id:typed,name:String(r.name||typed),mi,rows};
+  }
+  const dl=0.8,dn=0.8/Math.max(0.3,Math.cos(lat*Math.PI/180));
+  const near=await awc('bbox='+[lat-dl,lon-dn,lat+dl,lon+dn].map(x=>x.toFixed(2)).join(',')+'&hours=1');
+  const st=nearestStation(near,lat,lon,MAX_MI);
+  if(!st){const e=new Error('none');e.none=true;throw e;}
+  const rows=await awc('ids='+encodeURIComponent(st.id)+'&hours=24');
+  return{id:st.id,name:st.name,mi:st.mi,rows};
+}
+async function getAirport(quiet){
+  const msg=$('#aptMsg'),typed=($('#apt').value||'').trim().toUpperCase(),key=wxKey(),{lat,lon}=state.spot;
+  if(typed&&!/^[A-Z0-9]{3,4}$/.test(typed)){msg.className='msg err';msg.textContent='Enter the airport code, like KFZG, or leave it blank.';return;}
+  msg.className='msg';msg.textContent='Finding the closest airport…';$('#aptBtn').disabled=true;
+  try{
+    const f=await findAirport(lat,lon,typed),hours=obsToHours(f.rows);
+    if(!hours.length)throw new Error('no readings');
+    state.obs[key]={id:f.id,name:f.name,mi:f.mi,fetchedAt:Date.now(),hours:hours.slice(-30)};
+    const keys=Object.keys(state.obs);
+    if(keys.length>4){keys.sort((x,y)=>state.obs[x].fetchedAt-state.obs[y].fetchedAt);delete state.obs[keys[0]];}
+    store.set('obs',state.obs);rebuildWx();renderAll();
+    msg.textContent='Using '+f.id+' ('+f.name.replace(/, [A-Z]{2}, US$/,'')+'), '+Math.round(f.mi)+' mi away. Readings through '+new Date(hours[hours.length-1].last).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})+'. Saved for offline.';
+  }catch(e){
+    const kept=state.obs[key]?' Your last saved '+state.obs[key].id+' readings are still in use.':'';
+    msg.className='msg err';
+    msg.textContent=!navigator.onLine?'You are offline. Readings load when you have a signal.'
+      :e.far?typed+' is '+e.far+' miles from this spot, too far to trust.'+(kept||' The forecast is being used.')
+      :e.none?'No airport within '+MAX_MI+' miles of this spot reports weather.'+(kept||' The forecast is being used.')
+      :quiet?'Airport readings were not available.'+(kept||' The forecast is being used.')
+      :'Could not get airport readings (the service may be blocking this page, or the code is wrong).'+(kept||' The forecast is being used.');
+  }
+  $('#aptBtn').disabled=false;
+}
 async function download(){
   const msg=$('#dlMsg');msg.className='msg';msg.textContent='Downloading…';$('#dl').disabled=true;
   try{
@@ -516,6 +603,7 @@ async function download(){
     if(keys.length>4){keys.sort((a,b)=>state.wx[a].fetchedAt-state.wx[b].fetchedAt);delete state.wx[keys[0]];}
     store.set('wx',state.wx);rebuildWx();
     msg.textContent='Saved '+hours.length+' hours. It works without a signal now.';renderAll();
+    getAirport(true);
   }catch(e){
     msg.className='msg err';
     msg.textContent=navigator.onLine?'This page could not reach the weather service. Enter conditions by hand below, or use the home-screen version.':'You are offline. Download the forecast before you head out.';
@@ -575,6 +663,7 @@ $('#prev').onclick=()=>{const d=new Date(state.day);d.setDate(d.getDate()-1);sta
 $('#next').onclick=()=>{const d=new Date(state.day);d.setDate(d.getDate()+1);state.day=d.getTime();renderAll();};
 $('#today').onclick=()=>{state.day=startOfDay(Date.now());renderAll();};
 $('#dl').onclick=download;
+$('#aptBtn').onclick=()=>getAirport(false);
 $('#manualForm').addEventListener('submit',ev=>{
   ev.preventDefault();
   state.manual={on:true,example:false,p:parseFloat($('#mP').value)||30,trend:$('#mT').value,temp:parseFloat($('#mTemp').value),wind:parseFloat($('#mW').value)||0,dir:$('#mD').value===''?null:Number($('#mD').value),rain:$('#mR').value};

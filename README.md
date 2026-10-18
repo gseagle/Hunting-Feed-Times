@@ -21,7 +21,7 @@ Download again before each trip. Forecasts older than a day lose accuracy, espec
 
 GitHub Pages on a free account needs a public repository. Nothing private is in these files: spots, the log and any coordinates you enter are saved only in each phone's browser, not in the repo.
 
-When you change `index.html`, also change `CACHE = 'feed-window-v1'` in `sw.js` (for example to `v3`) so phones fetch the new version.
+When you change `index.html`, also change `CACHE = 'feed-window-v1'` in `sw.js` (for example to `v4`) so phones fetch the new version.
 
 ## How the score works
 
@@ -45,7 +45,7 @@ Fish scores use air temperature because water temperature is not in the forecast
 
 ## Data
 
-Weather comes from [Open-Meteo.com](https://open-meteo.com/) (free for non-commercial use, attribution required). Your coordinates are sent to Open-Meteo only when you tap Download forecast. Sun and moon positions are calculated on the device using the SunCalc method (MIT license), so they need no signal.
+Weather comes from [Open-Meteo.com](https://open-meteo.com/) (free for non-commercial use, attribution required). Your coordinates are sent to Open-Meteo only when you tap Download forecast. If you use the airport option, the airport code (not your location) is sent to the [Aviation Weather Center](https://aviationweather.gov/), and its actual readings replace the forecast for the hours they cover. Sun and moon positions are calculated on the device using the SunCalc method (MIT license), so they need no signal.
 
 ## Not legal advice
 
