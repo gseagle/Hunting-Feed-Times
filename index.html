@@ -392,6 +392,18 @@ function nearestStation(rows,lat,lon,maxMi){
   });
   return best;
 }
+/* National Weather Service station observations -> the same row shape as the METAR rows */
+function nwsRows(j){
+  return ((j&&j.features)||[]).map(f=>{
+    const p=(f&&f.properties)||{},g=f&&f.geometry&&f.geometry.coordinates,raw=String(p.rawMessage||''),m=raw.match(/\sA(\d{4})(\s|$)/);
+    const v=o=>o&&typeof o.value==='number'?o.value:null;
+    const alt=m?parseInt(m[1],10)/100/0.02953:v(p.seaLevelPressure)!=null?v(p.seaLevelPressure)/100:null;
+    const kmh=v(p.windSpeed);
+    return{icaoId:p.station?String(p.station).split('/').pop():null,lat:g&&typeof g[1]==='number'?g[1]:null,lon:g&&typeof g[0]==='number'?g[0]:null,
+      name:p.station?String(p.station).split('/').pop():'',obsTime:Date.parse(p.timestamp)/1000,temp:v(p.temperature),wdir:v(p.windDirection),
+      wspd:kmh==null?null:kmh/1.852,altim:alt,rawOb:raw};
+  }).filter(r=>r.altim!=null&&r.temp!=null&&isFinite(r.obsTime));
+}
 /* Airport (METAR) readings -> hourly records in the same shape as the forecast hours. */
 function obsToHours(rows){
   const by=new Map();
@@ -571,12 +583,38 @@ async function findAirport(lat,lon,typed){
   const rows=await awc('ids='+encodeURIComponent(st.id)+'&hours=24');
   return{id:st.id,name:st.name,mi:st.mi,rows};
 }
+async function nws(url){const r=await fetch(url);if(!r.ok)throw new Error('status '+r.status);return r.json();}
+async function findAirportNWS(lat,lon,typed){
+  const ok=(rows,id)=>{const r=rows.find(x=>typeof x.lat==='number');if(!r)return null;const mi=distMi(lat,lon,r.lat,r.lon);return{id,name:id,mi,rows};};
+  if(typed){
+    const f=ok(nwsRows(await nws('https://api.weather.gov/stations/'+encodeURIComponent(typed)+'/observations?limit=48')),typed);
+    if(!f)throw new Error('none');
+    if(f.mi>MAX_MI){const e=new Error('far');e.far=Math.round(f.mi);throw e;}
+    return f;
+  }
+  const pt=await nws('https://api.weather.gov/points/'+lat.toFixed(4)+','+lon.toFixed(4));
+  const list=await nws(pt.properties.observationStations);
+  const ids=((list&&list.features)||[]).map(x=>x.properties&&x.properties.stationIdentifier).filter(Boolean).slice(0,5);
+  for(const id of ids){
+    try{
+      const f=ok(nwsRows(await nws('https://api.weather.gov/stations/'+id+'/observations?limit=48')),id);
+      if(f&&f.mi<=MAX_MI&&Date.now()-Math.max(...f.rows.map(r=>r.obsTime))*1000<4*HR)return f;
+    }catch(e){}
+  }
+  const e=new Error('none');e.none=true;throw e;
+}
 async function getAirport(quiet){
   const msg=$('#aptMsg'),typed=($('#apt').value||'').trim().toUpperCase(),key=wxKey(),{lat,lon}=state.spot;
   if(typed&&!/^[A-Z0-9]{3,4}$/.test(typed)){msg.className='msg err';msg.textContent='Enter the airport code, like KFZG, or leave it blank.';return;}
   msg.className='msg';msg.textContent='Finding the closest airport…';$('#aptBtn').disabled=true;
   try{
-    const f=await findAirport(lat,lon,typed),hours=obsToHours(f.rows);
+    let f;
+    try{f=await findAirport(lat,lon,typed);}
+    catch(e1){
+      if(e1.far||e1.none)throw e1;
+      try{f=await findAirportNWS(lat,lon,typed);}catch(e2){if(e2.far||e2.none)throw e2;throw e1;}
+    }
+    const hours=obsToHours(f.rows);
     if(!hours.length)throw new Error('no readings');
     state.obs[key]={id:f.id,name:f.name,mi:f.mi,fetchedAt:Date.now(),hours:hours.slice(-30)};
     const keys=Object.keys(state.obs);
